@@ -1,0 +1,123 @@
+name: 晨更作业cf wop
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 3 * * 1"  # Monday 7AM
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Whether to force update (ignore version check)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check_out_the_code
+        uses: actions/checkout@v4
+
+      - name: Set up the Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+
+      - name: Install dependencies
+        run: |
+          npm install -g javascript-obfuscator
+          sudo apt-get update
+          sudo apt-get install -y jq curl unzip wget
+
+      - name: Environment variable settings
+        run: |
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
+          echo "TARGET_FILE=worker.js" >> $GITHUB_ENV  #  worker.js ,Can be modified to worker.zip
+
+      - name: Check and update Worker
+        id: update_worker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+
+          log "Set off early in the morning, checking for updates..."
+
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          log "local version：${LOCAL_VERSION:-none}"
+
+          log "Request latest Release info…"
+          RESPONSE=$(curl -s --retry 5 --retry-delay 2 --max-time 30 \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$REPO_URL")
+          if [ $? -ne 0 ]; then
+            log "❌ Unable to access GitHub API"
+            exit 1
+          fi
+
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            log "❌ Failed to obtain version number"
+            exit 1
+          fi
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            # Alternate download method Download the file from the repo
+            DOWNLOAD_URL="https://github.com/bia-pain-bache/BPB-Worker-Panel/raw/${TAG_NAME}/${TARGET_FILE}"
+            log "Release asset not found, use raw file to download URL: $DOWNLOAD_URL"
+          fi
+
+          log "latest version：$TAG_NAME"
+
+          FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "Already the latest version, no need to update"
+            exit 0
+          fi
+
+          log "Download $TARGET_FILE…"
+          wget -q --tries=5 --timeout=30 -O "origin.js" "$DOWNLOAD_URL"
+          if [ $? -ne 0 ]; then
+            log "Download failed"
+            exit 1
+          fi
+
+          # If zip, add decompression (currently assuming js; if zip, uncomment and adjust)
+          # log "Unzipping…"
+          # unzip -o "origin.js" > /dev/null  #Rename when it is actually zip
+          # rm "origin.js"
+          # mv worker.js origin.js  # Assume zip contains worker.js
+
+          log "Obfuscated JS code…"
+          javascript-obfuscator origin.js --output _worker.js \
+            --compact true \
+            --identifier-names-generator hexadecimal \
+            --rename-globals false \
+            --string-array false \
+            --transform-object-keys false \
+            --self-defending false \
+            --simplify true
+          echo "// Auto obfuscated at $(date -u)" >> _worker.js
+          rm origin.js
+
+          echo "$TAG_NAME" > version.txt
+          log "Update completed, current version：$TAG_NAME"
+
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Submit synchronization results
+        if: success()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Automatically synchronize Worker version: ${{ steps.update_worker.outputs.tag_name }}"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
